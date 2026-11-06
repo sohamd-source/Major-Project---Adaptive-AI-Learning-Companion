@@ -1,299 +1,360 @@
 """
-PUGU (Personalized Understanding and Guidance Unit)
-ADHD Task Chunker + Dyslexia Reading Overlay
-A single-file Streamlit app. No paid backend required.
+app.py - PUGU (Personalized Understanding and Guidance Unit)
 
-Run with:  streamlit run app.py
-
---------------------------------------------------------------------------
-FILE MAP (for anyone extending this later)
---------------------------------------------------------------------------
-1. Database helpers   -> init_db / get_settings / save_settings
-2. Tool 1              -> chunk_task_simple / chunk_task_ai   (ADHD chunker)
-3. Tool 2              -> render_reading_overlay              (Dyslexia overlay)
-4. App / UI            -> everything below the "App" divider, run top-to-bottom
-                           by Streamlit on every interaction (button click,
-                           slider drag, etc. all re-run this whole script).
-
-To add a THIRD tool: write its logic as a plain function above the "App"
-section (following the pattern of Tool 1 / Tool 2), then add a new tab in
-the `st.tabs([...])` call and a matching `with tab3:` block.
---------------------------------------------------------------------------
+Entry point: configuration check, Google login (blocks the app), per-user
+settings, sidebar, and tab routing for the ADHD and Dyslexia tools.
 """
 
-import re
-import sqlite3
-from pathlib import Path
+from __future__ import annotations
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Local SQLite file that stores per-user settings. Created automatically on
-# first run, sitting next to this script. Safe to delete to reset all data.
-DB_PATH = Path(__file__).parent / "pugu.db"
+import adhd_module
+import database
+import dyslexia_module
+
+DEFAULT_MODEL = "llama-3.1-8b-instant"  # override with [anthropic] model = "..." in secrets
+
+st.set_page_config(page_title="PUGU", page_icon="🧠", layout="wide")
 
 
-# ---------------------------------------------------------------------------
-# Database: just enough to remember each user's last-used settings.
-# This IS the "adaptive" part for now — simple, not an AI system.
-#
-# Schema: one row per user_id, storing their last-used chunk length, font,
-# and TTS toggle. If you add a new setting (e.g. a new tool's preference),
-# add a column here AND update get_settings/save_settings to match — the
-# three functions in this section always need to stay in sync.
-# ---------------------------------------------------------------------------
-
-def init_db():
-    """Open (or create) the SQLite file and make sure the settings table exists.
-    Called once at app startup. check_same_thread=False is needed because
-    Streamlit can touch the connection from more than one thread."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            user_id TEXT PRIMARY KEY,
-            chunk_minutes INTEGER DEFAULT 10,
-            font_choice TEXT DEFAULT 'OpenDyslexic',
-            tts_enabled INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    return conn
-
-
-def get_settings(conn, user_id):
-    """Look up a user's saved settings, or return sensible defaults if this
-    is a new/unknown user_id. Always returns a dict with all three keys so
-    callers never have to check for missing fields."""
-    row = conn.execute(
-        "SELECT chunk_minutes, font_choice, tts_enabled FROM settings WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
-    if row:
-        return {"chunk_minutes": row[0], "font_choice": row[1], "tts_enabled": bool(row[2])}
-    # Defaults for a brand-new user — keep these in sync with the table's
-    # own DEFAULT values above if you change one.
-    return {"chunk_minutes": 10, "font_choice": "OpenDyslexic", "tts_enabled": False}
-
-
-def save_settings(conn, user_id, chunk_minutes, font_choice, tts_enabled):
-    """Upsert: insert a new row for this user, or overwrite their existing
-    one if they already have settings saved. Called every time the user
-    takes an action so their latest choices become next session's defaults."""
-    conn.execute(
-        """
-        INSERT INTO settings (user_id, chunk_minutes, font_choice, tts_enabled)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            chunk_minutes=excluded.chunk_minutes,
-            font_choice=excluded.font_choice,
-            tts_enabled=excluded.tts_enabled
-        """,
-        (user_id, chunk_minutes, font_choice, int(tts_enabled)),
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Tool 1 — ADHD Task Chunker
-#
-# Two ways to generate steps:
-#   - chunk_task_simple: free, offline, template-based. Always used as a
-#     fallback so the app never fully breaks.
-#   - chunk_task_ai: optional, needs a user-supplied Anthropic API key,
-#     produces steps tailored to the actual task text.
-# ---------------------------------------------------------------------------
-
-def chunk_task_simple(task: str, chunk_minutes: int):
-    """Zero-cost fallback. No AI call, no API key needed. Always works.
-    Returns a generic 5-step template with the task name and chunk length
-    filled in. Tweak the wording/step count here if you want a different
-    default flow — this is what every user sees with no API key set."""
-    return [
-        f"Get set up: open/gather whatever you need for '{task}'",
-        f"Work on the first part of '{task}' for about {chunk_minutes} min",
-        "Take a short break — stand up, stretch, water",
-        f"Continue '{task}' for another {chunk_minutes} min",
-        f"Review what you've done on '{task}' and note what's left",
-    ]
-
-
-def chunk_task_ai(task: str, chunk_minutes: int, api_key: str):
-    """Optional: real LLM-generated steps, tailored to the specific task.
-    Falls back to chunk_task_simple() on ANY error (bad key, network issue,
-    rate limit, unexpected response shape, etc.) so a broken API call never
-    crashes the app — the user just silently gets the generic steps instead.
-
-    To change the model, prompt, or step count/format, edit the `prompt`
-    string and/or the `model=` argument below.
-    """
+# --------------------------------------------------------------------------- #
+# Configuration, login and session helpers
+# --------------------------------------------------------------------------- #
+def secrets_section_exists(name: str) -> bool:
+    """True if st.secrets has a section called `name` (safe if no secrets file)."""
     try:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
-        prompt = (
-            f"Break this task into 4-6 concrete, specific steps, each doable in about "
-            f"{chunk_minutes} minutes by someone with ADHD. Task: {task}\n"
-            f"Return ONLY a numbered list, nothing else."
-        )
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.content[0].text
-        # Strip leading numbering ("1.", "2)", etc.) since we render our own
-        # step numbers/UI — we just want the raw step text from each line.
-        steps = [
-            re.sub(r"^\d+[\.\)]\s*", "", line).strip()
-            for line in text.split("\n")
-            if line.strip()
-        ]
-        # If parsing produced nothing usable, fall back rather than show a
-        # blank step list.
-        return steps or chunk_task_simple(task, chunk_minutes)
+        return name in st.secrets
     except Exception:
-        return chunk_task_simple(task, chunk_minutes)
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Tool 2 — Dyslexia Reading Overlay
-#
-# Takes raw pasted text and returns a chunk of HTML: dyslexia-friendly
-# styling (font/spacing) plus an optional "read aloud" button that uses the
-# browser's built-in text-to-speech (no API key or server needed for this
-# part — it's 100% client-side JavaScript).
-# ---------------------------------------------------------------------------
+def check_configuration() -> None:
+    """Stop with a helpful message if required secrets are missing."""
+    missing = [n for n in ("auth", "supabase") if not secrets_section_exists(n)]
+    if missing:
+        st.error(
+            "Missing secrets section(s): "
+            + ", ".join(f"[{name}]" for name in missing)
+            + ". Add them to .streamlit/secrets.toml (see the setup instructions)."
+        )
+        st.stop()
 
-def render_reading_overlay(text: str, font_choice: str, tts_enabled: bool) -> str:
-    """Build the HTML/CSS/JS string that gets embedded via components.html().
 
-    - font_css: swap in a different web font here (see README for how to
-      actually load the OpenDyslexic font file/CDN).
-    - sentences/spans: text is split into per-sentence <span> tags so the
-      read-aloud feature can highlight each sentence as it's spoken.
-    - tts_block: only included when the user has enabled read-aloud;
-      contains the button + JS that drives the highlighting/speech.
-    """
-    font_css = "'OpenDyslexic', sans-serif" if font_choice == "OpenDyslexic" else "Arial, sans-serif"
+def get_ai_config() -> tuple[str | None, str]:
+    """Return (api_key, model) for Groq. The key is None when not configured."""
+    try:
+        section = st.secrets["groq"]
+        return (section.get("api_key") or None), section.get("model", DEFAULT_MODEL)
+    except Exception:
+        return None, DEFAULT_MODEL
 
-    # Split on sentence-ending punctuation followed by a space. Good enough
-    # for normal prose; won't handle abbreviations like "Dr." perfectly —
-    # swap in a proper sentence tokenizer (e.g. nltk) if that matters.
-    sentences = re.split(r"(?<=[.!?]) +", text.strip())
-    spans = "".join(f'<span class="sentence" id="s{i}">{s} </span>' for i, s in enumerate(sentences))
 
-    tts_block = ""
-    if tts_enabled:
-        # puguReadAloud() walks through each .sentence span in order,
-        # highlights it, and speaks it with the Web Speech API. Purely
-        # client-side — works offline, no external TTS service involved.
-        tts_block = """
-        <button onclick="puguReadAloud()" style="margin-top:12px; padding:8px 16px; font-size:16px;">
-            🔊 Read aloud
-        </button>
-        <script>
-        function puguReadAloud() {
-            const sentences = document.querySelectorAll('.sentence');
-            let i = 0;
-            function speakNext() {
-                if (i >= sentences.length) return;
-                sentences.forEach(s => s.style.background = 'transparent');
-                sentences[i].style.background = '#fff3b0';
-                const utter = new SpeechSynthesisUtterance(sentences[i].innerText);
-                utter.onend = () => { i++; speakNext(); };
-                window.speechSynthesis.speak(utter);
-            }
-            window.speechSynthesis.cancel();  // stop any speech already in progress
-            speakNext();
+def require_login() -> dict:
+    """Block the app until the user signs in with Google; return their identity."""
+    if not st.user.is_logged_in:
+        st.title("🧠 PUGU")
+        st.subheader("Personalized Understanding and Guidance Unit")
+        st.write(
+            "Calm, step-by-step support for focus and reading. "
+            "Please sign in with Google to continue."
+        )
+        if st.button("🔐 Sign in with Google", type="primary"):
+            st.login("google")
+        st.stop()
+
+    email = st.user.get("email")
+    google_id = st.user.get("sub") or email
+    if not google_id:
+        st.error("Google did not return an account ID. Please log out and try again.")
+        st.button("Log out", on_click=logout)
+        st.stop()
+
+    return {
+        "google_id": str(google_id),
+        "email": email,
+        "name": st.user.get("name") or email or "friend",
+    }
+
+
+def logout() -> None:
+    """Clear this session's data and log out of Google."""
+    st.session_state.clear()
+    st.logout()
+
+
+def init_session_state(user: dict) -> None:
+    """Load the user's saved settings into session state (once per login)."""
+    if st.session_state.get("owner_id") == user["google_id"]:
+        return
+
+    settings = database.get_user_settings(user["google_id"])
+    st.session_state.update(
+        {
+            "owner_id": user["google_id"],
+            "saved_settings": settings,
+            # Widget values are pre-set here so widgets start from saved settings.
+            "w_chunk_minutes": settings["chunk_minutes"],
+            "w_font": settings["font_choice"],
+            "w_bg": settings["bg_color"],
+            "w_tts": settings["tts_enabled"],
+            # ADHD tool state.
+            "steps": [],
+            "step_index": 0,
+            "skipped": [],
+            "used_ai": False,
+            "active_task": "",
+            "active_minutes": settings["chunk_minutes"],
+            "parked_thoughts": [],
+            "celebrate": False,
+            # Dyslexia tool state.
+            "overlay_text": "",
+            "overlay_wanted_ai": False,
+            "overlay_used_ai": False,
         }
-        </script>
-        """
-
-    return f"""
-    <div style="font-family: {font_css}; font-size: 20px; line-height: 2;
-                letter-spacing: 0.5px; max-width: 700px;">
-        {spans}
-    </div>
-    {tts_block}
-    """
-
-
-# ---------------------------------------------------------------------------
-# App / UI
-#
-# Everything below runs top-to-bottom on EVERY interaction (Streamlit
-# re-executes the whole script on each button click, slider move, etc.).
-# Session-scoped state that needs to survive between reruns (like the
-# current step index) lives in st.session_state.
-# ---------------------------------------------------------------------------
-
-st.set_page_config(page_title="PUGU", page_icon="🧠")
-conn = init_db()  # one connection, reused for the whole session
-
-st.title("🧠 PUGU")
-st.caption("Personalized Understanding and Guidance Unit")
-
-# user_id is just a free-text name typed by the user — it's the primary key
-# used to look up/save their settings. No auth; anyone can type any name to
-# load "their" settings. Fine for an MVP, but swap for real auth/session IDs
-# before sharing this beyond trusted testers.
-user_id = st.text_input("Your name (so the app remembers your settings)", value="guest")
-settings = get_settings(conn, user_id)
-
-tab1, tab2 = st.tabs(["ADHD: Task Chunker", "Dyslexia: Reading Overlay"])
-
-# --- Tab 1: Task Chunker ---
-with tab1:
-    st.subheader("Break a task into small steps")
-    task = st.text_input("What do you need to do?")
-    chunk_minutes = st.slider("Preferred step length (minutes)", 3, 20, settings["chunk_minutes"])
-    # API key is entered fresh each session (type="password" hides it) and
-    # is never saved to disk — only the chunk_minutes/font/tts settings are
-    # persisted in the DB.
-    api_key = st.text_input("Anthropic API key (optional — leave blank to use the free version)", type="password")
-
-    if st.button("Break it down") and task:
-        # Save settings first so the choice sticks even if the AI call below fails.
-        save_settings(conn, user_id, chunk_minutes, settings["font_choice"], settings["tts_enabled"])
-        steps = chunk_task_ai(task, chunk_minutes, api_key) if api_key else chunk_task_simple(task, chunk_minutes)
-        # Stashed in session_state so the step-by-step walkthrough below
-        # persists across reruns (e.g. when "Done, next step" is clicked).
-        st.session_state["steps"] = steps
-        st.session_state["current_step"] = 0
-
-    # Step-by-step walkthrough: shows one step at a time, advances on
-    # either button. This block only renders once a task has been chunked.
-    if "steps" in st.session_state:
-        idx = st.session_state["current_step"]
-        steps = st.session_state["steps"]
-        if idx < len(steps):
-            st.markdown(f"### Step {idx + 1} of {len(steps)}")
-            st.info(steps[idx])
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ Done, next step"):
-                    st.session_state["current_step"] += 1
-                    st.rerun()  # force immediate re-render with the new step
-            with col2:
-                if st.button("⏭️ Skip"):
-                    st.session_state["current_step"] += 1
-                    st.rerun()
-        else:
-            st.success("All steps complete! 🎉")
-
-# --- Tab 2: Reading Overlay ---
-with tab2:
-    st.subheader("Read text in a dyslexia-friendly format")
-    text = st.text_area("Paste your text here", height=150)
-    font_choice = st.selectbox(
-        "Font", ["OpenDyslexic", "Standard"],
-        index=0 if settings["font_choice"] == "OpenDyslexic" else 1,
     )
-    tts_enabled = st.checkbox("Enable read-aloud", value=settings["tts_enabled"])
 
+
+def current_settings() -> dict:
+    """Collect the current widget values into a settings dict."""
+    return {
+        "chunk_minutes": st.session_state.w_chunk_minutes,
+        "font_choice": st.session_state.w_font,
+        "tts_enabled": st.session_state.w_tts,
+        "bg_color": st.session_state.w_bg,
+    }
+
+
+def persist_settings(user: dict) -> None:
+    """Save the current settings to Supabase and remember them in session state."""
+    settings = current_settings()
+    if database.upsert_user_settings(user["google_id"], user["email"], settings):
+        st.session_state.saved_settings = settings
+        st.toast("Preferences saved", icon="💾")
+
+
+# --------------------------------------------------------------------------- #
+# ADHD tab callbacks (run before the next rerun, so balloons are not cut off)
+# --------------------------------------------------------------------------- #
+def on_done() -> None:
+    st.session_state.step_index += 1
+    st.session_state.celebrate = True
+
+
+def on_skip() -> None:
+    steps = st.session_state.steps
+    index = st.session_state.step_index
+    if index < len(steps):
+        st.session_state.skipped.append(steps[index])
+    st.session_state.step_index = index + 1
+
+
+def on_park_thought() -> None:
+    thought = st.session_state.brain_dump_input.strip()
+    if thought:
+        st.session_state.parked_thoughts.append(thought)
+    st.session_state.brain_dump_input = ""
+
+
+def on_restart() -> None:
+    st.session_state.update(
+        steps=[], step_index=0, skipped=[], active_task="", celebrate=False
+    )
+    st.session_state.task_input = ""
+
+
+# --------------------------------------------------------------------------- #
+# ADHD tab
+# --------------------------------------------------------------------------- #
+def render_brain_dump() -> None:
+    """The 'I'm Distracted' expander for parking off-topic thoughts."""
+    with st.expander("🌀 I'm Distracted - park a thought"):
+        st.text_area(
+            "Brain Dump: write it down, then get back to your step.",
+            key="brain_dump_input",
+            height=90,
+        )
+        st.button("🅿️ Park it", on_click=on_park_thought)
+        if st.session_state.parked_thoughts:
+            st.markdown("**Parked for later:**")
+            for thought in st.session_state.parked_thoughts:
+                st.markdown(f"- {thought}")
+        st.caption("Parked thoughts stay in this session only.")
+
+
+def render_blinkers() -> None:
+    """Blinkers UI: show exactly ONE step at a time."""
+    steps = st.session_state.steps
+    if not steps:
+        return
+
+    st.divider()
+    if st.session_state.celebrate:
+        st.balloons()
+        st.session_state.celebrate = False
+
+    index = st.session_state.step_index
+    st.caption(f"Task: {st.session_state.active_task}")
+    if not st.session_state.used_ai:
+        st.caption("ℹ️ Showing generic steps (AI is unavailable right now).")
+
+    if index >= len(steps):
+        st.success("🎉 All steps finished. Great work!")
+        if st.session_state.skipped:
+            st.markdown("**You skipped these - come back when you're ready:**")
+            for step in st.session_state.skipped:
+                st.markdown(f"- {step}")
+        st.button("Start a new task", on_click=on_restart)
+    else:
+        st.progress(index / len(steps), text=f"Step {index + 1} of {len(steps)}")
+        with st.container(border=True):
+            st.markdown(f"## {steps[index]}")
+            st.caption(
+                f"Give it about {st.session_state.active_minutes} minutes. "
+                "Nothing else matters right now."
+            )
+        col_done, col_skip = st.columns([2, 1])
+        col_done.button("✅ Done, next step", type="primary", on_click=on_done)
+        col_skip.button("⏭️ Skip step", on_click=on_skip)
+
+    render_brain_dump()
+
+
+def render_adhd_tab(user: dict) -> None:
+    st.subheader("🎯 Break a big task into tiny steps")
+    st.text_area(
+        "What do you need to get done?",
+        key="task_input",
+        height=110,
+        max_chars=500,
+        placeholder="e.g. Write the introduction for my history essay",
+    )
+    st.slider(
+        "Minutes per step",
+        min_value=database.CHUNK_MINUTES_MIN,
+        max_value=database.CHUNK_MINUTES_MAX,
+        step=database.CHUNK_MINUTES_STEP,
+        key="w_chunk_minutes",
+    )
+
+    if st.button("🧩 Break it down", type="primary"):
+        task = st.session_state.task_input.strip()
+        if not task:
+            st.warning("Please type a task first.")
+        else:
+            persist_settings(user)
+            api_key, model = get_ai_config()
+            minutes = st.session_state.w_chunk_minutes
+            with st.spinner("Breaking your task into small steps..."):
+                steps, used_ai = adhd_module.chunk_task(task, minutes, api_key, model)
+            st.session_state.update(
+                steps=steps,
+                step_index=0,
+                skipped=[],
+                used_ai=used_ai,
+                active_task=task,
+                active_minutes=minutes,
+            )
+
+    render_blinkers()
+
+
+# --------------------------------------------------------------------------- #
+# Dyslexia tab
+# --------------------------------------------------------------------------- #
+def render_dyslexia_tab(user: dict) -> None:
+    st.subheader("📖 Reading overlay")
+    st.text_area(
+        "Paste the text you want to read",
+        key="dyslexia_input",
+        height=200,
+        max_chars=dyslexia_module.MAX_INPUT_CHARS,
+    )
+
+    col_font, col_bg, col_tts = st.columns(3)
+    col_font.selectbox("Typography", database.FONT_CHOICES, key="w_font")
+    col_bg.selectbox("Background color", database.BG_COLOR_CHOICES, key="w_bg")
+    col_tts.toggle("🔊 Read aloud (TTS)", key="w_tts")
+
+    simplify = st.checkbox("✨ Simplify difficult words with AI", value=True)
+
+    if st.button("📄 Render text", type="primary"):
+        raw = st.session_state.dyslexia_input.strip()
+        if not raw:
+            st.warning("Please paste some text first.")
+        else:
+            persist_settings(user)
+            final_text, used_ai = raw, False
+            if simplify:
+                api_key, model = get_ai_config()
+                with st.spinner("Simplifying the wording..."):
+                    final_text, used_ai = dyslexia_module.simplify_text(raw, api_key, model)
+            st.session_state.update(
+                overlay_text=final_text,
+                overlay_wanted_ai=simplify,
+                overlay_used_ai=used_ai,
+            )
+
+    text = st.session_state.overlay_text
     if text:
-        # Settings are saved as soon as there's text, before rendering, so
-        # the user's font/TTS choice is captured even if they never click
-        # an explicit "save" button (there isn't one in this tab).
-        save_settings(conn, user_id, settings["chunk_minutes"], font_choice, tts_enabled)
-        components.html(render_reading_overlay(text, font_choice, tts_enabled), height=420, scrolling=True)
+        if st.session_state.overlay_wanted_ai and not st.session_state.overlay_used_ai:
+            st.info("Couldn't simplify the text right now, so your original text is shown.")
+        # Fonts, colors and TTS follow the dropdowns instantly (no new AI call).
+        overlay = dyslexia_module.build_overlay_html(
+            text,
+            st.session_state.w_font,
+            st.session_state.w_bg,
+            st.session_state.w_tts,
+        )
+        components.html(
+            overlay,
+            height=dyslexia_module.estimate_height(text, st.session_state.w_tts),
+            scrolling=True,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar and main
+# --------------------------------------------------------------------------- #
+def render_sidebar(user: dict) -> None:
+    saved = st.session_state.saved_settings
+    with st.sidebar:
+        st.header("🧠 PUGU")
+        st.write(f"Signed in as **{user['name']}**")
+        if user["email"]:
+            st.caption(user["email"])
+        st.button("Log out", on_click=logout)
+        st.divider()
+        st.subheader("Saved preferences")
+        st.markdown(
+            f"- Minutes per step: **{saved['chunk_minutes']}**\n"
+            f"- Typography: **{saved['font_choice']}**\n"
+            f"- Background: **{saved['bg_color']}**\n"
+            f"- Read aloud: **{'On' if saved['tts_enabled'] else 'Off'}**"
+        )
+        st.caption(
+            "Saved when you click 'Break it down' or 'Render text', "
+            "and loaded automatically next time you sign in."
+        )
+
+
+def main() -> None:
+    check_configuration()
+    user = require_login()
+    init_session_state(user)
+
+    st.title("🧠 PUGU")
+    st.caption("Personalized Understanding and Guidance Unit")
+
+    tab_adhd, tab_dyslexia = st.tabs(["🎯 Focus (ADHD)", "📖 Read (Dyslexia)"])
+    with tab_adhd:
+        render_adhd_tab(user)
+    with tab_dyslexia:
+        render_dyslexia_tab(user)
+
+    # Rendered last so it reflects settings saved during this run.
+    render_sidebar(user)
+
+
+main()
