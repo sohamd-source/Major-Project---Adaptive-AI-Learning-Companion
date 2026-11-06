@@ -50,21 +50,37 @@ def _strip_preamble(text: str) -> str:
     return re.sub(r"^\s*here(?:'s| is)[^\n]*:\s*\n+", "", text, flags=re.IGNORECASE).strip()
 
 
+def _request_options(model: str, normal_tokens: int, reasoning_tokens: int) -> dict:
+    """
+    Model-specific request settings.
+
+    "gpt-oss" models think before answering, and that hidden thinking uses up
+    the token budget. They get a bigger budget and a request for low reasoning
+    effort; other models use the normal budget.
+    """
+    if "gpt-oss" in model.lower():
+        return {"max_tokens": reasoning_tokens, "extra_body": {"reasoning_effort": "low"}}
+    return {"max_tokens": normal_tokens}
+
+
 def simplify_text_ai(text: str, api_key: str, model: str) -> str:
     """Simplify `text` with a Groq-hosted model. Raises on any failure or empty reply."""
     client = Groq(api_key=api_key, timeout=45.0, max_retries=1)
     completion = client.chat.completions.create(
         model=model,
-        max_tokens=1800,
         temperature=0.2,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"<text>\n{text}\n</text>"},
         ],
+        **_request_options(model, normal_tokens=1800, reasoning_tokens=3500),
     )
     simplified = _strip_preamble(completion.choices[0].message.content or "")
     if not simplified:
-        raise ValueError("The model returned an empty response.")
+        raise ValueError(
+            "The model returned an empty reply (its token budget may have been "
+            "used up by reasoning)."
+        )
     return simplified
 
 

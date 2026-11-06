@@ -6,15 +6,37 @@ settings, sidebar, and tab routing for the ADHD and Dyslexia tools.
 """
 
 from __future__ import annotations
+try:
+    import truststore
 
+    truststore.inject_into_ssl()  # trust the Windows certificate store (needed on networks that inspect HTTPS)
+except Exception:
+    pass
 import streamlit as st
 import streamlit.components.v1 as components
+from groq import Groq
 
 import adhd_module
 import database
 import dyslexia_module
 
-DEFAULT_MODEL = "llama-3.1-8b-instant"  # override with [anthropic] model = "..." in secrets
+# Last-resort model name, used only if the model list can't be fetched.
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+# Best first. Plain chat models come before "reasoning" models, because reasoning
+# models spend part of their output budget on hidden thinking.
+PREFERRED_MODELS = (
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+)
+
+# Model names containing these words can't do chat (speech, safety filters, etc.).
+EXCLUDED_KEYWORDS = (
+    "whisper", "tts", "orpheus", "playai", "guard", "safeguard", "embed", "compound",
+)
 
 st.set_page_config(page_title="PUGU", page_icon="🧠", layout="wide")
 
@@ -42,13 +64,51 @@ def check_configuration() -> None:
         st.stop()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_groq_models(api_key: str) -> list[str]:
+    """Return the model IDs this Groq key can use (cached for one hour)."""
+    client = Groq(api_key=api_key, timeout=15.0, max_retries=1)
+    return sorted(model.id for model in client.models.list().data)
+
+
+def pick_model(available: list[str]) -> str | None:
+    """Choose the best usable chat model from the list Groq returned."""
+    usable = [
+        name for name in available
+        if not any(word in name.lower() for word in EXCLUDED_KEYWORDS)
+    ]
+    for preferred in PREFERRED_MODELS:
+        if preferred in usable:
+            return preferred
+    for name in usable:  # any other Llama chat model
+        if "llama" in name.lower():
+            return name
+    return usable[0] if usable else None
+
+
 def get_ai_config() -> tuple[str | None, str]:
-    """Return (api_key, model) for Groq. The key is None when not configured."""
+    """
+    Return (api_key, model) for Groq.
+
+    A `model` line in secrets always wins. Otherwise the best available model
+    is chosen automatically from what the key can use.
+    """
     try:
         section = st.secrets["groq"]
-        return (section.get("api_key") or None), section.get("model", DEFAULT_MODEL)
+        api_key = section.get("api_key") or None
+        pinned_model = section.get("model")
     except Exception:
         return None, DEFAULT_MODEL
+
+    if not api_key:
+        return None, DEFAULT_MODEL
+    if pinned_model:
+        return api_key, pinned_model
+
+    try:
+        return api_key, pick_model(list_groq_models(api_key)) or DEFAULT_MODEL
+    except Exception:
+        return api_key, DEFAULT_MODEL
 
 
 def require_login() -> dict:
@@ -184,36 +244,53 @@ def render_brain_dump() -> None:
 
 
 def render_blinkers() -> None:
-    """Blinkers UI: show exactly ONE step at a time."""
+    """
+    Blinkers UI: show exactly ONE step at a time.
+
+    Shows a clear warning (with the reason) when the AI step-maker failed and
+    generic fallback steps are being shown instead.
+    """
     steps = st.session_state.steps
     if not steps:
         return
 
     st.divider()
+
+    # Micro-reward: the callback sets this flag, and balloons are shown on the
+    # rerun that follows so they are not cut off.
     if st.session_state.celebrate:
         st.balloons()
         st.session_state.celebrate = False
 
     index = st.session_state.step_index
-    st.caption(f"Task: {st.session_state.active_task}")
-    if not st.session_state.used_ai:
-        st.caption("ℹ️ Showing generic steps (AI is unavailable right now).")
+    total = len(steps)
 
-    if index >= len(steps):
+    st.caption(f"Task: {st.session_state.active_task}")
+
+    if not st.session_state.used_ai:
+        st.warning(
+            "The AI step-maker is not working, so these are generic steps. "
+            f"Reason: {st.session_state.get('ai_error') or 'unknown'}"
+        )
+
+    if index >= total:
+        # Finished (or skipped) every step.
         st.success("🎉 All steps finished. Great work!")
         if st.session_state.skipped:
-            st.markdown("**You skipped these - come back when you're ready:**")
+            st.markdown("**You skipped these. Come back to them when you're ready:**")
             for step in st.session_state.skipped:
                 st.markdown(f"- {step}")
         st.button("Start a new task", on_click=on_restart)
     else:
-        st.progress(index / len(steps), text=f"Step {index + 1} of {len(steps)}")
+        # Current step only: no list of upcoming steps, to reduce overwhelm.
+        st.progress(index / total, text=f"Step {index + 1} of {total}")
         with st.container(border=True):
             st.markdown(f"## {steps[index]}")
             st.caption(
                 f"Give it about {st.session_state.active_minutes} minutes. "
                 "Nothing else matters right now."
             )
+
         col_done, col_skip = st.columns([2, 1])
         col_done.button("✅ Done, next step", type="primary", on_click=on_done)
         col_skip.button("⏭️ Skip step", on_click=on_skip)
@@ -247,12 +324,13 @@ def render_adhd_tab(user: dict) -> None:
             api_key, model = get_ai_config()
             minutes = st.session_state.w_chunk_minutes
             with st.spinner("Breaking your task into small steps..."):
-                steps, used_ai = adhd_module.chunk_task(task, minutes, api_key, model)
+                steps, used_ai, ai_error = adhd_module.chunk_task(task, minutes, api_key, model)
             st.session_state.update(
                 steps=steps,
                 step_index=0,
                 skipped=[],
                 used_ai=used_ai,
+                ai_error=ai_error,
                 active_task=task,
                 active_minutes=minutes,
             )
@@ -333,6 +411,7 @@ def render_sidebar(user: dict) -> None:
             f"- Background: **{saved['bg_color']}**\n"
             f"- Read aloud: **{'On' if saved['tts_enabled'] else 'Off'}**"
         )
+        st.caption(f"AI model: {get_ai_config()[1]}")
         st.caption(
             "Saved when you click 'Break it down' or 'Render text', "
             "and loaded automatically next time you sign in."

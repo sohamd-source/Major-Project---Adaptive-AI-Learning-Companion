@@ -51,13 +51,24 @@ def _parse_steps(raw: str) -> list[str]:
         raise ValueError(f"Model returned only {len(steps)} usable steps.")
     return steps[:MAX_STEPS]
 
+def _request_options(model: str, normal_tokens: int, reasoning_tokens: int) -> dict:
+    """
+    Model-specific request settings.
+
+    "gpt-oss" models think before answering, and that hidden thinking uses up
+    the token budget. They get a bigger budget and a request for low reasoning
+    effort; other models use the normal budget.
+    """
+    if "gpt-oss" in model.lower():
+        return {"max_tokens": reasoning_tokens, "extra_body": {"reasoning_effort": "low"}}
+    return {"max_tokens": normal_tokens}
+
 
 def chunk_task_ai(task: str, chunk_minutes: int, api_key: str, model: str) -> list[str]:
     """Ask a Groq-hosted model to split `task` into 4-6 micro-steps. Raises on failure."""
     client = Groq(api_key=api_key, timeout=30.0, max_retries=1)
     completion = client.chat.completions.create(
         model=model,
-        max_tokens=600,
         temperature=0.3,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -66,10 +77,15 @@ def chunk_task_ai(task: str, chunk_minutes: int, api_key: str, model: str) -> li
                 "content": f"Task: {task}\nMinutes available per step: {chunk_minutes}",
             },
         ],
+        **_request_options(model, normal_tokens=600, reasoning_tokens=1500),
     )
     raw = completion.choices[0].message.content or ""
+    if not raw.strip():
+        raise ValueError(
+            "The model returned an empty reply (its token budget may have been "
+            "used up by reasoning)."
+        )
     return _parse_steps(raw)
-
 
 def chunk_task_fallback(task: str, chunk_minutes: int) -> list[str]:
     """Return generic, always-available steps when the AI cannot be used."""
@@ -85,15 +101,21 @@ def chunk_task_fallback(task: str, chunk_minutes: int) -> list[str]:
 
 def chunk_task(
     task: str, chunk_minutes: int, api_key: str | None, model: str
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, str | None]:
     """
     Chunk a task into micro-steps.
 
-    Returns (steps, used_ai). `used_ai` is False when the fallback was used.
+    Returns (steps, used_ai, error). `error` explains why the fallback was used
+    (None when the AI worked).
     """
-    if api_key:
-        try:
-            return chunk_task_ai(task, chunk_minutes, api_key, model), True
-        except Exception:  # rate limit, network, or parse failure: degrade gracefully
-            logger.warning("AI task chunking failed; using fallback.", exc_info=True)
-    return chunk_task_fallback(task, chunk_minutes), False
+    if not api_key:
+        return (
+            chunk_task_fallback(task, chunk_minutes),
+            False,
+            "No Groq API key found. Check the [groq] section in .streamlit/secrets.toml.",
+        )
+    try:
+        return chunk_task_ai(task, chunk_minutes, api_key, model), True, None
+    except Exception as exc:  # rate limit, network, or parse failure
+        logger.warning("AI task chunking failed; using fallback.", exc_info=True)
+        return chunk_task_fallback(task, chunk_minutes), False, f"{type(exc).__name__}: {exc}"
